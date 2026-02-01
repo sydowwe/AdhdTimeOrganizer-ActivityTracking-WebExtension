@@ -4,6 +4,7 @@ A cross-browser extension for Chrome, Edge, and Firefox that tracks browser acti
 
 ## Features
 
+- **JWT Authentication**: Secure login with access and refresh tokens
 - **Activity Tracking**: Tracks time spent on websites
   - **Active tracking**: The focused tab in the focused browser window
   - **Background tracking**: Visible tabs (e.g., on second monitor) or audible tabs
@@ -35,10 +36,13 @@ A cross-browser extension for Chrome, Edge, and Firefox that tracks browser acti
    npm install
    ```
 
-3. Configure the API endpoint in `src/shared/config.ts`:
+3. Configure the API endpoints in `src/shared/config.ts`:
    ```typescript
-   export const API_URL = 'https://your-api.example.com/activity';
-   export const API_KEY = 'your-api-key-here';
+   export const API_BASE_URL = 'https://your-api.example.com';
+   export const API_ACTIVITY_ENDPOINT = '/activity-tracking/heartbeat';
+   export const API_LOGIN_ENDPOINT = '/user/extension/login';
+   export const API_REFRESH_ENDPOINT = '/user/extension/refresh';
+   export const API_LOGOUT_ENDPOINT = '/user/extension/logout';
    ```
 
 4. Generate icons (open `icons/generate-icons.html` in a browser and save each canvas as PNG), or replace with your own icons.
@@ -87,11 +91,12 @@ src/
 │   ├── index.ts          # Service worker main entry
 │   ├── tracker.ts        # Core tracking logic
 │   ├── api.ts            # API communication
+│   ├── auth.ts           # JWT authentication manager
 │   └── storage.ts        # Local storage helpers
 ├── content/
 │   └── visibility.ts     # Content script for visibility detection
 ├── popup/
-│   ├── popup.html
+│   ├── popup.html        # Popup with login form
 │   ├── popup.ts
 │   └── popup.css
 ├── options/
@@ -100,31 +105,96 @@ src/
 │   └── options.css
 └── shared/
     ├── types.ts          # Shared TypeScript interfaces
-    ├── config.ts         # API_URL, API_KEY constants
+    ├── config.ts         # API endpoints, configuration
     └── utils.ts          # Helper functions
 ```
 
 ## API Integration
 
-The extension sends heartbeat data every 30 seconds:
+### Authentication
 
-```typescript
-interface ActivityHeartbeat {
-  heartbeatAt: string; // ISO 8601 timestamp
-  isIdle: boolean;
-  events: ActivityEvent[];
-}
+The extension uses JWT authentication with access and refresh tokens.
 
-interface ActivityEvent {
-  type: 'start' | 'end';
-  domain: string;
-  url?: string; // included based on user settings
-  isBackground: boolean;
-  at: string; // ISO 8601 timestamp
+#### Login Endpoint
+**POST** `/user/extension/login`
+
+Request:
+```json
+{
+  "email": "user@example.com",
+  "password": "password123"
 }
 ```
 
-API requests include the header `X-Api-Key: {API_KEY}`.
+Response:
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIs...",
+  "refreshToken": "dGhpcyBpcyBhIHJlZnJl...",
+  "expiresIn": 3600
+}
+```
+
+#### Refresh Endpoint
+**POST** `/user/extension/refresh`
+
+Request:
+```json
+{
+  "refreshToken": "dGhpcyBpcyBhIHJlZnJl..."
+}
+```
+
+Response:
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIs...",
+  "expiresIn": 3600
+}
+```
+
+#### Logout Endpoint (optional)
+**POST** `/user/extension/logout`
+
+Request:
+```json
+{
+  "refreshToken": "dGhpcyBpcyBhIHJlZnJl..."
+}
+```
+
+### Activity Heartbeat
+
+**POST** `/activity-tracking/heartbeat`
+
+Headers:
+```
+Authorization: Bearer <accessToken>
+Content-Type: application/json
+```
+
+Request:
+```json
+{
+  "heartbeatAt": "2024-01-15T10:30:00.000Z",
+  "isIdle": false,
+  "events": [
+    {
+      "type": "start",
+      "domain": "github.com",
+      "url": "https://github.com/user/repo",
+      "isBackground": false,
+      "at": "2024-01-15T10:29:55.000Z"
+    },
+    {
+      "type": "end",
+      "domain": "stackoverflow.com",
+      "isBackground": false,
+      "at": "2024-01-15T10:29:50.000Z"
+    }
+  ]
+}
+```
 
 ## Configuration
 
@@ -132,17 +202,33 @@ API requests include the header `X-Api-Key: {API_KEY}`.
 
 | Constant | Description | Default |
 |----------|-------------|---------|
-| `API_URL` | Backend API endpoint | - |
-| `API_KEY` | API authentication key | - |
+| `API_BASE_URL` | Backend API base URL | - |
+| `API_ACTIVITY_ENDPOINT` | Activity heartbeat endpoint | `/activity-tracking/heartbeat` |
+| `API_LOGIN_ENDPOINT` | Login endpoint | `/user/extension/login` |
+| `API_REFRESH_ENDPOINT` | Token refresh endpoint | `/user/extension/refresh` |
+| `API_LOGOUT_ENDPOINT` | Logout endpoint | `/user/extension/logout` |
 | `DEBOUNCE_THRESHOLD_MS` | Minimum visit duration to track | 5000ms |
 | `HEARTBEAT_INTERVAL_MS` | API heartbeat interval | 30000ms |
 | `IDLE_THRESHOLD_SECONDS` | Idle detection threshold | 180s |
+| `TOKEN_REFRESH_BUFFER_MS` | Refresh token before expiry | 60000ms |
 | `DEBUG_LOGGING` | Enable console logging | true |
 
 ### User Settings (Options Page)
 
 - **Blocklist**: Domains to exclude from tracking
 - **Full URL Tracking**: Domains where full URL should be tracked instead of domain-only
+
+## Authentication Flow
+
+1. User opens popup and sees login form
+2. User enters email and password
+3. Extension sends credentials to `/auth/login`
+4. Backend returns access token, refresh token, and expiry time
+5. Tokens are stored in `chrome.storage.local`
+6. Access token is included in `Authorization` header for API calls
+7. Token is automatically refreshed 1 minute before expiry
+8. On 401 response, token refresh is attempted automatically
+9. If refresh fails, user is logged out and must re-authenticate
 
 ## Browser Compatibility
 

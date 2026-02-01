@@ -1,0 +1,25 @@
+{
+  "name": "timeorganizer-activity-tracking",
+  "version": "1.0.0",
+  "description": "Cross-browser extension for tracking browser activity",
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "npm run generate-icons && vite build",
+    "build:firefox": "npm run generate-icons && cross-env BROWSER=firefox vite build",
+    "build:chrome": "npm run generate-icons && cross-env BROWSER=chrome vite build",
+    "build:all": "npm run build:chrome && npm run build:firefox",
+    "generate-icons": "node scripts/generate-icons.cjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.33.1",
+    "@types/chrome": "^0.0.268",
+    "@types/webextension-polyfill": "^0.10.7",
+    "cross-env": "^7.0.3",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.11",
+    "vite-plugin-web-extension": "^4.1.6",
+    "webextension-polyfill": "^0.11.0"
+  }
+}
