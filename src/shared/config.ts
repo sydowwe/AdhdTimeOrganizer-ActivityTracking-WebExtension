@@ -1,5 +1,5 @@
 // API Configuration - Set these values for your backend
-export const API_BASE_URL = 'https://api.example.com';
+export const API_BASE_URL = 'https://localhost:8080/api';
 export const API_ACTIVITY_ENDPOINT = '/activity-tracking/heartbeat';
 export const API_LOGIN_ENDPOINT = '/auth/extension/login';
 export const API_REFRESH_ENDPOINT = '/auth/extension/refresh';
