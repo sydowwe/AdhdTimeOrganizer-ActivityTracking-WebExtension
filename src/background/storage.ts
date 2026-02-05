@@ -1,5 +1,5 @@
 import browser from 'webextension-polyfill';
-import type { UserSettings, DailyStats, ActivityEvent, DomainStat } from '@shared/types';
+import type { UserSettings, DailyStats, ActivityEvent, DomainStat, ActivityWindow } from '@shared/types';
 import { log } from '@shared/config';
 import { getTodayDateString } from '@shared/utils';
 
@@ -165,4 +165,37 @@ export async function getTopDomains(limit: number = 5): Promise<DomainStat[]> {
   return domains
     .sort((a, b) => (b.activeTime + b.backgroundTime) - (a.activeTime + a.backgroundTime))
     .slice(0, limit);
+}
+
+// Update daily stats from activity window
+export async function updateStatsFromWindow(window: ActivityWindow): Promise<void> {
+  const stats = await getDailyStats();
+
+  for (const activity of window.activities) {
+    const domain = activity.domain;
+
+    if (!stats.domainStats[domain]) {
+      stats.domainStats[domain] = {
+        domain,
+        activeTime: 0,
+        backgroundTime: 0,
+        visits: 0
+      };
+    }
+
+    const domainStat = stats.domainStats[domain];
+    const activeMs = activity.activeSeconds * 1000;
+    const backgroundMs = activity.backgroundSeconds * 1000;
+
+    domainStat.activeTime += activeMs;
+    domainStat.backgroundTime += backgroundMs;
+    stats.totalActiveTime += activeMs;
+    stats.totalBackgroundTime += backgroundMs;
+
+    // Increment visits (one per activity in window)
+    domainStat.visits += 1;
+  }
+
+  await saveDailyStats(stats);
+  log('Updated daily stats from window');
 }

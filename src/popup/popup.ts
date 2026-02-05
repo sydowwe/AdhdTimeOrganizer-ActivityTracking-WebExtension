@@ -19,6 +19,9 @@ const mainView = document.getElementById('main-view') as HTMLElement;
 const currentDomain = document.getElementById('current-domain') as HTMLElement;
 const currentTime = document.getElementById('current-time') as HTMLElement;
 const sessionStart = document.getElementById('session-start') as HTMLElement;
+const windowStart = document.getElementById('window-start') as HTMLElement;
+const windowStatus = document.getElementById('window-status') as HTMLElement;
+const windowPreview = document.getElementById('window-preview') as HTMLElement;
 const activeTime = document.getElementById('active-time') as HTMLElement;
 const backgroundTime = document.getElementById('background-time') as HTMLElement;
 const domainList = document.getElementById('domain-list') as HTMLElement;
@@ -77,8 +80,12 @@ function updateStatsUI(stats: StatsResponse): void {
   };
   statusText.textContent = statusLabels[stats.status] || stats.status;
 
-  // Update current session
-  if (stats.currentSession.activeTab) {
+  // Update current session - show spinner if pending
+  if (stats.currentSession.isPending && stats.currentSession.pendingDomain) {
+    // Show pending state with spinner
+    currentDomain.innerHTML = `<span class="spinner"></span> ${escapeHtml(stats.currentSession.pendingDomain)}`;
+    currentTime.textContent = 'Starting...';
+  } else if (stats.currentSession.activeTab) {
     currentDomain.textContent = stats.currentSession.activeTab.domain;
     currentTime.textContent = formatDuration(stats.currentSession.currentSiteTime);
   } else {
@@ -88,6 +95,37 @@ function updateStatsUI(stats: StatsResponse): void {
 
   const sessionDate = new Date(stats.currentSession.sessionStartTime);
   sessionStart.textContent = sessionDate.toLocaleTimeString();
+
+  // Update current window
+  if (stats.currentWindow && stats.currentWindow.activities.length > 0) {
+    const windowDate = new Date(stats.currentWindow.windowStart);
+    windowStart.textContent = windowDate.toLocaleTimeString();
+    windowStatus.textContent = stats.currentWindow.isFinal ? 'Complete' : 'Recording';
+
+    // Show window activities
+    const windowActivities = stats.currentWindow.activities
+      .sort((a, b) => (b.activeSeconds + b.backgroundSeconds) - (a.activeSeconds + a.backgroundSeconds))
+      .slice(0, 5);
+
+    windowPreview.innerHTML = windowActivities
+      .map(function(activity) {
+        const totalSeconds = activity.activeSeconds + activity.backgroundSeconds;
+        const activePercent = totalSeconds > 0 ? Math.round((activity.activeSeconds / totalSeconds) * 100) : 0;
+        return `
+          <div class="window-activity">
+            <span class="window-domain">${escapeHtml(activity.domain)}</span>
+            <span class="window-time">
+              ${activity.activeSeconds}s active, ${activity.backgroundSeconds}s bg
+            </span>
+          </div>
+        `;
+      })
+      .join('');
+  } else {
+    windowStart.textContent = '-';
+    windowStatus.textContent = '-';
+    windowPreview.innerHTML = '<p class="empty-state">No activity in current window</p>';
+  }
 
   // Update today's stats
   activeTime.textContent = formatDuration(stats.todayStats.totalActiveTime);
@@ -225,6 +263,9 @@ function openOptions(): void {
 }
 
 function startStatsUpdates(): void {
+  // Stop any existing interval first to prevent duplicates
+  stopStatsUpdates();
+
   // Fetch immediately
   fetchStats().then(function(stats) {
     if (stats) {

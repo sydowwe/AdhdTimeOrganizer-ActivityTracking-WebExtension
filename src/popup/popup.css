@@ -252,6 +252,53 @@ body {
   text-transform: uppercase;
 }
 
+/* Window info */
+.window-info {
+  background: #f5f5f5;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.window-preview {
+  background: #f5f5f5;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.window-preview .empty-state {
+  color: #999;
+  font-style: italic;
+  text-align: center;
+  padding: 8px;
+  margin: 0;
+}
+
+.window-activity {
+  padding: 8px;
+  background: white;
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+
+.window-activity:last-child {
+  margin-bottom: 0;
+}
+
+.window-domain {
+  display: block;
+  font-weight: 500;
+  font-size: 13px;
+  color: #333;
+  margin-bottom: 4px;
+}
+
+.window-time {
+  display: block;
+  font-size: 11px;
+  color: #666;
+}
+
 /* Top domains */
 .top-domains h3 {
   font-size: 12px;
@@ -371,12 +418,19 @@ body {
 /* Loading spinner */
 .spinner {
   display: inline-block;
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgba(255,255,255,0.3);
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(25, 118, 210, 0.2);
   border-radius: 50%;
-  border-top-color: white;
+  border-top-color: #1976d2;
   animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+
+.btn .spinner {
+  border-color: rgba(255, 255, 255, 0.3);
+  border-top-color: white;
 }
 
 @keyframes spin {

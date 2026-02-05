@@ -4,7 +4,7 @@ import { authManager } from './auth';
 import { sendHeartbeat } from './api';
 import { HEARTBEAT_INTERVAL_MS, log, logError } from '@shared/config';
 import type { Message, LoginCredentials } from '@shared/types';
-import { saveSettings } from './storage';
+import { saveSettings, updateStatsFromWindow } from './storage';
 
 const HEARTBEAT_ALARM_NAME = 'heartbeat';
 
@@ -46,9 +46,15 @@ browser.alarms.onAlarm.addListener(async (alarm) => {
 
     // Only send heartbeat if authenticated
     if (authManager.isAuthenticated()) {
-      const events = tracker.getPendingEvents();
+      const window = tracker.getActivityWindow();
       const isIdle = tracker.getIsIdle();
-      await sendHeartbeat(events, isIdle);
+      const success = await sendHeartbeat(window, isIdle);
+
+      // If window was final and successfully sent, update daily stats and clear buffer
+      if (success && window?.isFinal) {
+        await updateStatsFromWindow(window);
+        tracker.clearCurrentBuffer();
+      }
     } else {
       log('Skipping heartbeat - not authenticated');
     }

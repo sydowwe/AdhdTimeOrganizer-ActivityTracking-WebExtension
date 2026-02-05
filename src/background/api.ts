@@ -1,5 +1,5 @@
 import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios';
-import type { ActivityEvent, ActivityHeartbeat } from '@shared/types';
+import type { ActivityEvent, ActivityHeartbeat, ActivityWindow } from '@shared/types';
 import {
   API_BASE_URL,
   API_ACTIVITY_ENDPOINT,
@@ -124,36 +124,30 @@ API.interceptors.response.use(
 );
 
 /**
- * Send heartbeat with events to the API
- * Returns true if successful, false if failed (events will be queued)
+ * Send heartbeat with activity window to the API
+ * Returns true if successful, false otherwise
  */
 export async function sendHeartbeat(
-  events: ActivityEvent[],
+  window: ActivityWindow | null,
   isIdle: boolean
 ): Promise<boolean> {
   // Check if authenticated
   const accessToken = authManager.getAccessToken();
   if (!accessToken) {
-    log('Not authenticated, queuing events');
-    if (events.length > 0) {
-      await addQueuedEvents(events);
-    }
+    log('Not authenticated, skipping heartbeat');
     return false;
   }
 
-  // Get any previously queued events
-  const queuedEvents = await getQueuedEvents();
-  const allEvents = [...queuedEvents, ...events];
-
-  if (allEvents.length === 0 && !isIdle) {
-    log('No events to send, skipping heartbeat');
+  // If no window data and not idle, skip heartbeat
+  if (!window && !isIdle) {
+    log('No window data to send, skipping heartbeat');
     return true;
   }
 
   const heartbeat: ActivityHeartbeat = {
     heartbeatAt: getTimestamp(),
     isIdle,
-    events: allEvents
+    window: window || undefined
   };
 
   try {
@@ -161,22 +155,10 @@ export async function sendHeartbeat(
 
     await API.post(API_ACTIVITY_ENDPOINT, heartbeat);
 
-    // Success - clear the queue if we had queued events
-    if (queuedEvents.length > 0) {
-      await clearQueuedEvents();
-      log('Cleared queued events after successful send');
-    }
-
     log('Heartbeat sent successfully');
     return true;
   } catch (error) {
     logError('Failed to send heartbeat:', error);
-
-    // Queue the new events for retry (don't re-add already queued events)
-    if (events.length > 0) {
-      await addQueuedEvents(events);
-    }
-
     return false;
   }
 }

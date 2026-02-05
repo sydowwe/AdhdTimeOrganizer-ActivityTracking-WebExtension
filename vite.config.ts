@@ -51,6 +51,11 @@ export default defineConfig({
               matches: ['<all_urls>'],
               js: ['src/content/visibility.ts'],
               run_at: 'document_start'
+            },
+            {
+              matches: ['<all_urls>'],
+              js: ['src/content/videoDetector.ts'],
+              run_at: 'document_idle'
             }
           ],
           action: {

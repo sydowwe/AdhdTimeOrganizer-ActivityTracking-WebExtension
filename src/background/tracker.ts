@@ -1,5 +1,5 @@
 import browser from 'webextension-polyfill';
-import type { ActivityEvent, TabState, UserSettings, StatsResponse } from '@shared/types';
+import type { TabState, UserSettings, StatsResponse, ActivityWindow, WindowActivity } from '@shared/types';
 import {
   DEBOUNCE_THRESHOLD_MS,
   IDLE_THRESHOLD_SECONDS,
@@ -9,13 +9,11 @@ import {
   extractDomain,
   isDomainBlocked,
   shouldTrackFullUrl,
-  getTimestamp,
   isTrackableUrl
 } from '@shared/utils';
 import {
   getSettings,
   getDailyStats,
-  updateDomainTime,
   getTrackerState,
   saveTrackerState
 } from './storage';
@@ -29,17 +27,36 @@ interface PendingTabState {
   timeoutId: ReturnType<typeof setTimeout>;
 }
 
+interface DomainBuffer {
+  activeSeconds: number;
+  backgroundSeconds: number;
+  urlVisits: Map<string, number>; // URL -> seconds spent
+}
+
+interface ActivityBuffer {
+  windowStart: number; // Unix timestamp in ms, rounded to 5-min boundary
+  domains: Map<string, DomainBuffer>;
+}
+
+const WINDOW_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+const TICK_INTERVAL_MS = 1000; // Check every second
+
 class ActivityTracker {
   private activeTab: TabState | null = null;
   private backgroundTabs: Map<number, TabState> = new Map();
   private visibleTabs: Set<number> = new Set();
   private audibleTabs: Set<number> = new Set();
-  private pendingEvents: ActivityEvent[] = [];
+  private videoPlayingTabs: Set<number> = new Set();
   private isIdle: boolean = false;
   private isPaused: boolean = false;
   private sessionStartTime: number = Date.now();
   private settings: UserSettings = { blocklist: [], trackFullUrlDomains: [] };
   private pendingStarts: Map<number, PendingTabState> = new Map();
+
+  // Window aggregation
+  private activityBuffer: ActivityBuffer | null = null;
+  private lastTickAt: number = Date.now();
+  private tickInterval: ReturnType<typeof setInterval> | null = null;
 
   async initialize(): Promise<void> {
     log('Initializing ActivityTracker');
@@ -52,11 +69,23 @@ class ActivityTracker {
     this.isPaused = state.isPaused;
     this.sessionStartTime = state.sessionStartTime;
 
+    // Save state to ensure sessionStartTime persists across restarts
+    await saveTrackerState({
+      isPaused: this.isPaused,
+      sessionStartTime: this.sessionStartTime
+    });
+
+    // Load or create activity buffer
+    await this.loadOrCreateBuffer();
+
     // Set up event listeners
     this.setupEventListeners();
 
     // Initialize with current tab state
     await this.initializeCurrentState();
+
+    // Start ticker for window aggregation
+    this.startTicker();
 
     log('ActivityTracker initialized', {
       isPaused: this.isPaused,
@@ -109,10 +138,13 @@ class ActivityTracker {
       }
     });
 
-    // Listen for visibility messages from content scripts
+    // Listen for visibility and video messages from content scripts
     browser.runtime.onMessage.addListener((message, sender) => {
       if (message.type === 'VISIBILITY_CHANGED' && sender.tab?.id) {
         this.handleVisibilityChanged(sender.tab.id, message.payload.isVisible);
+      }
+      if (message.type === 'VIDEO_PLAYING_CHANGED' && sender.tab?.id) {
+        this.handleVideoPlayingChanged(sender.tab.id, message.payload.hasPlayingVideo);
       }
       return undefined;
     });
@@ -120,19 +152,25 @@ class ActivityTracker {
 
   private async initializeCurrentState(): Promise<void> {
     try {
-      // Get all windows to find focused one
+      // Get all windows to find focused one or most recently active one
       const windows = await browser.windows.getAll({ windowTypes: ['normal'] });
-      const focusedWindow = windows.find(w => w.focused);
+      let targetWindow = windows.find(w => w.focused);
 
-      if (focusedWindow && focusedWindow.id !== undefined) {
-        // Get active tab in focused window
+      // If no normal window is focused (e.g., popup is open), use any normal window
+      // This handles the case where popup is open during initialization
+      if (!targetWindow && windows.length > 0) {
+        targetWindow = windows[0];
+      }
+
+      if (targetWindow && targetWindow.id !== undefined) {
+        // Get active tab in target window
         const tabs = await browser.tabs.query({
           active: true,
-          windowId: focusedWindow.id
+          windowId: targetWindow.id
         });
 
         if (tabs.length > 0 && tabs[0].id !== undefined) {
-          await this.handleTabActivated(tabs[0].id, focusedWindow.id);
+          await this.handleTabActivated(tabs[0].id, targetWindow.id);
         }
       }
 
@@ -195,8 +233,41 @@ class ActivityTracker {
     if (this.isPaused) return;
 
     try {
+      // Check if the focused window is an extension popup
+      if (windowId !== browser.windows.WINDOW_ID_NONE) {
+        const window = await browser.windows.get(windowId);
+        if (window.type === 'popup') {
+          // This is a popup window - check if it's our extension popup
+          const tabs = await browser.tabs.query({ windowId });
+          if (tabs.length > 0 && tabs[0].url) {
+            const extensionUrl = browser.runtime.getURL('');
+            if (tabs[0].url.startsWith(extensionUrl)) {
+              // This is our extension popup - ignore this focus change
+              log('Extension popup focused, maintaining tracking state');
+              return;
+            }
+          }
+        }
+      }
+
       if (windowId === browser.windows.WINDOW_ID_NONE) {
-        // Browser lost focus - move active tab to background if visible/audible
+        // Check if focus moved to a popup/devtools window (extension popup, etc)
+        // If so, ignore this focus change to maintain tracking
+        const allWindows = await browser.windows.getAll({ populate: true });
+        const hasExtensionPopupFocused = allWindows.some(w => {
+          if (!w.focused || w.type !== 'popup') return false;
+          // Check if any tab in this popup window is an extension page
+          const extensionUrl = browser.runtime.getURL('');
+          return w.tabs?.some(tab => tab.url?.startsWith(extensionUrl));
+        });
+
+        if (hasExtensionPopupFocused) {
+          // Extension popup is focused - ignore this focus change
+          log('Extension popup focused, maintaining tracking state');
+          return;
+        }
+
+        // Browser actually lost focus - move active tab to background if visible/audible
         if (this.activeTab) {
           const wasActive = this.activeTab;
           await this.endActiveTracking();
@@ -270,8 +341,8 @@ class ActivityTracker {
       }
     } else {
       this.audibleTabs.delete(tabId);
-      // If not visible either, stop background tracking
-      if (!this.visibleTabs.has(tabId)) {
+      // If not visible or playing video either, stop background tracking
+      if (!this.visibleTabs.has(tabId) && !this.videoPlayingTabs.has(tabId)) {
         await this.endBackgroundTracking(tabId);
       }
     }
@@ -282,10 +353,44 @@ class ActivityTracker {
 
     if (isVisible) {
       this.visibleTabs.add(tabId);
+      // Maybe start background tracking if this tab should be tracked
+      if (this.activeTab?.tabId !== tabId) {
+        browser.tabs.get(tabId).then(tab => {
+          if (tab.url) {
+            this.maybeStartBackgroundTracking(tabId, tab.url);
+          }
+        }).catch(() => {
+          // Tab may have been closed
+        });
+      }
     } else {
       this.visibleTabs.delete(tabId);
-      // If not audible either and is a background tab, stop tracking
-      if (!this.audibleTabs.has(tabId)) {
+      // If not audible, not playing video, and is a background tab, stop tracking
+      if (!this.audibleTabs.has(tabId) && !this.videoPlayingTabs.has(tabId)) {
+        this.endBackgroundTracking(tabId);
+      }
+    }
+  }
+
+  private handleVideoPlayingChanged(tabId: number, hasPlayingVideo: boolean): void {
+    log('Video playing changed for tab', tabId, ':', hasPlayingVideo);
+
+    if (hasPlayingVideo) {
+      this.videoPlayingTabs.add(tabId);
+      // If not active, maybe start background tracking
+      if (this.activeTab?.tabId !== tabId) {
+        browser.tabs.get(tabId).then(tab => {
+          if (tab.url) {
+            this.maybeStartBackgroundTracking(tabId, tab.url);
+          }
+        }).catch(() => {
+          // Tab may have been closed
+        });
+      }
+    } else {
+      this.videoPlayingTabs.delete(tabId);
+      // If not visible or audible either, stop background tracking
+      if (!this.visibleTabs.has(tabId) && !this.audibleTabs.has(tabId)) {
         this.endBackgroundTracking(tabId);
       }
     }
@@ -302,6 +407,7 @@ class ActivityTracker {
     // Clean up tracking
     this.visibleTabs.delete(tabId);
     this.audibleTabs.delete(tabId);
+    this.videoPlayingTabs.delete(tabId);
 
     if (this.activeTab?.tabId === tabId) {
       await this.endActiveTracking();
@@ -369,19 +475,6 @@ class ActivityTracker {
       isTracking: true
     };
 
-    // Create start event
-    const event: ActivityEvent = {
-      type: 'start',
-      domain,
-      isBackground: false,
-      at: getTimestamp()
-    };
-
-    if (shouldTrackFullUrl(domain, this.settings)) {
-      event.url = url;
-    }
-
-    this.pendingEvents.push(event);
     log('Started active tracking:', domain);
   }
 
@@ -403,23 +496,6 @@ class ActivityTracker {
     const tab = this.activeTab;
     const duration = Date.now() - tab.startTime;
 
-    // Create end event
-    const event: ActivityEvent = {
-      type: 'end',
-      domain: tab.domain,
-      isBackground: false,
-      at: getTimestamp()
-    };
-
-    if (shouldTrackFullUrl(tab.domain, this.settings)) {
-      event.url = tab.url;
-    }
-
-    this.pendingEvents.push(event);
-
-    // Update stats
-    await updateDomainTime(tab.domain, duration, false);
-
     log('Ended active tracking:', tab.domain, 'duration:', duration);
     this.activeTab = null;
   }
@@ -434,11 +510,12 @@ class ActivityTracker {
     const domain = extractDomain(url);
     if (isDomainBlocked(domain, this.settings.blocklist)) return;
 
-    // Check if tab is visible or audible
+    // Check if tab is visible, audible, or has playing video
     const isVisible = this.visibleTabs.has(tabId);
     const isAudible = this.audibleTabs.has(tabId);
+    const hasPlayingVideo = this.videoPlayingTabs.has(tabId);
 
-    if (!isVisible && !isAudible) return;
+    if (!isVisible && !isAudible && !hasPlayingVideo) return;
 
     // Cancel any existing pending start for this tab
     const existingPending = this.pendingStarts.get(tabId);
@@ -479,19 +556,6 @@ class ActivityTracker {
 
     this.backgroundTabs.set(tabId, tabState);
 
-    // Create start event
-    const event: ActivityEvent = {
-      type: 'start',
-      domain,
-      isBackground: true,
-      at: getTimestamp()
-    };
-
-    if (shouldTrackFullUrl(domain, this.settings)) {
-      event.url = url;
-    }
-
-    this.pendingEvents.push(event);
     log('Started background tracking:', domain);
   }
 
@@ -511,25 +575,209 @@ class ActivityTracker {
 
     const duration = Date.now() - tab.startTime;
 
-    // Create end event
-    const event: ActivityEvent = {
-      type: 'end',
-      domain: tab.domain,
-      isBackground: true,
-      at: getTimestamp()
-    };
-
-    if (shouldTrackFullUrl(tab.domain, this.settings)) {
-      event.url = tab.url;
-    }
-
-    this.pendingEvents.push(event);
-
-    // Update stats
-    await updateDomainTime(tab.domain, duration, true);
-
     log('Ended background tracking:', tab.domain, 'duration:', duration);
     this.backgroundTabs.delete(tabId);
+  }
+
+  // Window aggregation methods
+  private roundToWindowBoundary(timestamp: number): number {
+    return Math.floor(timestamp / WINDOW_DURATION_MS) * WINDOW_DURATION_MS;
+  }
+
+  private async loadOrCreateBuffer(): Promise<void> {
+    try {
+      const stored = await browser.storage.local.get('activityBuffer');
+      if (stored.activityBuffer) {
+        const data = stored.activityBuffer;
+        this.activityBuffer = {
+          windowStart: data.windowStart,
+          domains: new Map(Object.entries(data.domains).map(([domain, buffer]: [string, any]) => [
+            domain,
+            {
+              activeSeconds: buffer.activeSeconds,
+              backgroundSeconds: buffer.backgroundSeconds,
+              urlVisits: new Map(Object.entries(buffer.urlVisits))
+            }
+          ]))
+        };
+        log('Loaded activity buffer from storage');
+      } else {
+        this.createNewBuffer();
+      }
+    } catch (error) {
+      log('Error loading buffer, creating new:', error);
+      this.createNewBuffer();
+    }
+  }
+
+  private createNewBuffer(): void {
+    const now = Date.now();
+    this.activityBuffer = {
+      windowStart: this.roundToWindowBoundary(now),
+      domains: new Map()
+    };
+    log('Created new activity buffer for window:', new Date(this.activityBuffer.windowStart).toISOString());
+  }
+
+  private async persistBuffer(): Promise<void> {
+    if (!this.activityBuffer) return;
+
+    try {
+      const data = {
+        windowStart: this.activityBuffer.windowStart,
+        domains: Object.fromEntries(
+          Array.from(this.activityBuffer.domains.entries()).map(([domain, buffer]) => [
+            domain,
+            {
+              activeSeconds: buffer.activeSeconds,
+              backgroundSeconds: buffer.backgroundSeconds,
+              urlVisits: Object.fromEntries(buffer.urlVisits)
+            }
+          ])
+        )
+      };
+      await browser.storage.local.set({ activityBuffer: data });
+    } catch (error) {
+      log('Error persisting buffer:', error);
+    }
+  }
+
+  private startTicker(): void {
+    // Clear any existing ticker
+    if (this.tickInterval) {
+      clearInterval(this.tickInterval);
+    }
+
+    this.lastTickAt = Date.now();
+
+    this.tickInterval = setInterval(() => {
+      this.onTick();
+    }, TICK_INTERVAL_MS);
+
+    log('Ticker started');
+  }
+
+  private stopTicker(): void {
+    if (this.tickInterval) {
+      clearInterval(this.tickInterval);
+      this.tickInterval = null;
+    }
+  }
+
+  private onTick(): void {
+    const now = Date.now();
+    const elapsedSeconds = Math.floor((now - this.lastTickAt) / 1000);
+    this.lastTickAt = now;
+
+    if (elapsedSeconds <= 0 || this.isPaused || this.isIdle) {
+      return;
+    }
+
+    // Check if we need to rotate to a new window
+    const currentWindowStart = this.roundToWindowBoundary(now);
+    if (this.activityBuffer && this.activityBuffer.windowStart !== currentWindowStart) {
+      log('Window boundary crossed, creating new buffer');
+      // The old buffer will be sent in the next heartbeat
+      this.createNewBuffer();
+    }
+
+    if (!this.activityBuffer) {
+      this.createNewBuffer();
+    }
+
+    // Accumulate time for active tab
+    if (this.activeTab?.isTracking) {
+      const domain = this.activeTab.domain;
+      if (!this.activityBuffer!.domains.has(domain)) {
+        this.activityBuffer!.domains.set(domain, {
+          activeSeconds: 0,
+          backgroundSeconds: 0,
+          urlVisits: new Map()
+        });
+      }
+      const buffer = this.activityBuffer!.domains.get(domain)!;
+      buffer.activeSeconds += elapsedSeconds;
+
+      // Track URL if configured
+      if (shouldTrackFullUrl(domain, this.settings)) {
+        const url = this.activeTab.url;
+        buffer.urlVisits.set(url, (buffer.urlVisits.get(url) || 0) + elapsedSeconds);
+      }
+    }
+
+    // Accumulate time for background tabs
+    for (const bgTab of this.backgroundTabs.values()) {
+      if (bgTab.isTracking) {
+        const domain = bgTab.domain;
+        if (!this.activityBuffer!.domains.has(domain)) {
+          this.activityBuffer!.domains.set(domain, {
+            activeSeconds: 0,
+            backgroundSeconds: 0,
+            urlVisits: new Map()
+          });
+        }
+        const buffer = this.activityBuffer!.domains.get(domain)!;
+        buffer.backgroundSeconds += elapsedSeconds;
+
+        // Track URL if configured
+        if (shouldTrackFullUrl(domain, this.settings)) {
+          const url = bgTab.url;
+          buffer.urlVisits.set(url, (buffer.urlVisits.get(url) || 0) + elapsedSeconds);
+        }
+      }
+    }
+
+    // Persist buffer periodically (every 10 ticks = 10 seconds)
+    if (now % 10000 < TICK_INTERVAL_MS) {
+      this.persistBuffer();
+    }
+  }
+
+  getActivityWindow(): ActivityWindow | null {
+    if (!this.activityBuffer || this.activityBuffer.domains.size === 0) {
+      return null;
+    }
+
+    const now = Date.now();
+    const currentWindowStart = this.roundToWindowBoundary(now);
+    const isFinal = this.activityBuffer.windowStart < currentWindowStart;
+
+    const activities: WindowActivity[] = [];
+    for (const [domain, buffer] of this.activityBuffer.domains.entries()) {
+      // Find most visited URL for this domain
+      let mostVisitedUrl: string | undefined;
+      let maxSeconds = 0;
+      for (const [url, seconds] of buffer.urlVisits.entries()) {
+        if (seconds > maxSeconds) {
+          maxSeconds = seconds;
+          mostVisitedUrl = url;
+        }
+      }
+
+      const activity: WindowActivity = {
+        domain,
+        activeSeconds: buffer.activeSeconds,
+        backgroundSeconds: buffer.backgroundSeconds
+      };
+
+      if (mostVisitedUrl && shouldTrackFullUrl(domain, this.settings)) {
+        activity.url = mostVisitedUrl;
+      }
+
+      activities.push(activity);
+    }
+
+    return {
+      windowStart: new Date(this.activityBuffer.windowStart).toISOString(),
+      windowMinutes: 5,
+      isFinal,
+      activities
+    };
+  }
+
+  clearCurrentBuffer(): void {
+    this.createNewBuffer();
+    this.persistBuffer();
   }
 
   // Public methods
@@ -567,12 +815,6 @@ class ActivityTracker {
     return this.isPaused;
   }
 
-  getPendingEvents(): ActivityEvent[] {
-    const events = [...this.pendingEvents];
-    this.pendingEvents = [];
-    return events;
-  }
-
   getIsIdle(): boolean {
     return this.isIdle;
   }
@@ -589,13 +831,31 @@ class ActivityTracker {
       currentSiteTime = Date.now() - this.activeTab.startTime;
     }
 
+    // Check if there's a pending active tab start (in debounce period)
+    let isPending = false;
+    let pendingDomain: string | undefined;
+
+    for (const pending of this.pendingStarts.values()) {
+      if (!pending.isBackground) {
+        // Found a pending active tab
+        isPending = true;
+        pendingDomain = pending.domain;
+        break;
+      }
+    }
+
+    const currentWindow = this.getActivityWindow();
+
     return {
       todayStats,
       currentSession: {
         activeTab: this.activeTab,
         sessionStartTime: this.sessionStartTime,
-        currentSiteTime
+        currentSiteTime,
+        isPending,
+        pendingDomain
       },
+      currentWindow: currentWindow || undefined,
       status
     };
   }

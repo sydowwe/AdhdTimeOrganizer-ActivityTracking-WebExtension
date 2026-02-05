@@ -7,10 +7,25 @@ export interface ActivityEvent {
   at: string; // ISO 8601 timestamp
 }
 
+// Window aggregation for 5-minute intervals
+export interface ActivityWindow {
+  windowStart: string; // ISO 8601 timestamp, rounded to 5-min boundary
+  windowMinutes: number; // Always 5
+  isFinal: boolean; // True if window is complete and won't be updated
+  activities: WindowActivity[];
+}
+
+export interface WindowActivity {
+  domain: string;
+  url?: string; // Most visited URL for this domain in the window
+  activeSeconds: number;
+  backgroundSeconds: number;
+}
+
 export interface ActivityHeartbeat {
   heartbeatAt: string; // ISO 8601 timestamp
   isIdle: boolean;
-  events: ActivityEvent[];
+  window?: ActivityWindow; // Current or completed window
 }
 
 // Tab tracking state
@@ -95,6 +110,7 @@ export interface StoredData {
 // Messages between background and content scripts
 export type MessageType =
   | 'VISIBILITY_CHANGED'
+  | 'VIDEO_PLAYING_CHANGED'
   | 'GET_VISIBILITY'
   | 'GET_STATS'
   | 'GET_CURRENT_STATE'
@@ -113,8 +129,14 @@ export interface Message {
 export interface VisibilityMessage extends Message {
   type: 'VISIBILITY_CHANGED';
   payload: {
-    tabId: number;
     isVisible: boolean;
+  };
+}
+
+export interface VideoPlayingMessage extends Message {
+  type: 'VIDEO_PLAYING_CHANGED';
+  payload: {
+    hasPlayingVideo: boolean;
   };
 }
 
@@ -129,6 +151,9 @@ export interface StatsResponse {
     activeTab: TabState | null;
     sessionStartTime: number;
     currentSiteTime: number;
+    isPending: boolean; // True if tab is in debounce period (< 5 seconds)
+    pendingDomain?: string; // Domain of pending tab
   };
+  currentWindow?: ActivityWindow; // Current 5-minute aggregation window
   status: 'tracking' | 'paused' | 'idle' | 'unauthenticated';
 }
