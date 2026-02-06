@@ -14,6 +14,9 @@ const passwordInput = document.getElementById('password') as HTMLInputElement;
 const loginError = document.getElementById('login-error') as HTMLElement;
 const loginBtn = document.getElementById('login-btn') as HTMLButtonElement;
 
+// DOM Elements - Success View
+const successView = document.getElementById('success-view') as HTMLElement;
+
 // DOM Elements - Main View
 const mainView = document.getElementById('main-view') as HTMLElement;
 const currentDomain = document.getElementById('current-domain') as HTMLElement;
@@ -58,6 +61,7 @@ async function fetchStats(): Promise<StatsResponse | null> {
 function showLoginView(): void {
   loginView.classList.remove('hidden');
   mainView.classList.add('hidden');
+  successView.classList.add('hidden');
   statusIndicator.className = 'status-indicator unauthenticated';
   statusText.textContent = 'Not signed in';
 }
@@ -65,7 +69,16 @@ function showLoginView(): void {
 function showMainView(authState: AuthState): void {
   loginView.classList.add('hidden');
   mainView.classList.remove('hidden');
+  successView.classList.add('hidden');
   userEmail.textContent = authState.userEmail || '';
+}
+
+function showSuccessView(): void {
+  loginView.classList.add('hidden');
+  mainView.classList.add('hidden');
+  successView.classList.remove('hidden');
+  statusIndicator.className = 'status-indicator tracking';
+  statusText.textContent = 'Authenticated';
 }
 
 function updateStatsUI(stats: StatsResponse): void {
@@ -207,19 +220,22 @@ async function handleLogin(event: Event): Promise<void> {
       emailInput.value = '';
       passwordInput.value = '';
 
-      // Get updated auth state and show main view
-      const authState = await getAuthState();
-      if (authState?.isAuthenticated) {
-        showMainView(authState);
-        startStatsUpdates();
-      }
+      // Show success view
+      showSuccessView();
+
+      // Close popup after showing success message
+      setTimeout(function() {
+        window.close();
+      }, 1500);
     } else {
       showLoginError(response.error || 'Login failed');
+      isLoggingIn = false;
+      loginBtn.disabled = false;
+      loginBtn.textContent = 'Sign In';
     }
   } catch (error) {
     console.error('Login error:', error);
     showLoginError('An error occurred. Please try again.');
-  } finally {
     isLoggingIn = false;
     loginBtn.disabled = false;
     loginBtn.textContent = 'Sign In';

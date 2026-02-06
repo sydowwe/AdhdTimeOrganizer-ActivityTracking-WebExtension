@@ -39,7 +39,7 @@ A cross-browser extension for Chrome, Edge, and Firefox that tracks browser acti
 3. Configure the API endpoints in `src/shared/config.ts`:
    ```typescript
    export const API_BASE_URL = 'https://your-api.example.com';
-   export const API_ACTIVITY_ENDPOINT = '/activity-tracking/heartbeat';
+   export const API_ACTIVITY_ENDPOINT = '/activity-tracking/web-extension/heartbeat';
    export const API_LOGIN_ENDPOINT = '/user/extension/login';
    export const API_REFRESH_ENDPOINT = '/user/extension/refresh';
    export const API_LOGOUT_ENDPOINT = '/user/extension/logout';
@@ -165,7 +165,7 @@ Request:
 
 ### Activity Heartbeat
 
-**POST** `/activity-tracking/heartbeat`
+**POST** `/activity-tracking/web-extension/heartbeat`
 
 Headers:
 ```
@@ -203,7 +203,7 @@ Request:
 | Constant | Description | Default |
 |----------|-------------|---------|
 | `API_BASE_URL` | Backend API base URL | - |
-| `API_ACTIVITY_ENDPOINT` | Activity heartbeat endpoint | `/activity-tracking/heartbeat` |
+| `API_ACTIVITY_ENDPOINT` | Activity heartbeat endpoint | `/activity-tracking/web-extension/heartbeat` |
 | `API_LOGIN_ENDPOINT` | Login endpoint | `/user/extension/login` |
 | `API_REFRESH_ENDPOINT` | Token refresh endpoint | `/user/extension/refresh` |
 | `API_LOGOUT_ENDPOINT` | Logout endpoint | `/user/extension/logout` |
