@@ -1,12 +1,19 @@
 import type { UserSettings } from './types';
 
 /**
- * Extract domain from a URL string
+ * Extract domain from a URL string, stripping www. prefix
  */
 export function extractDomain(url: string): string {
   try {
     const urlObj = new URL(url);
-    return urlObj.hostname;
+    let hostname = urlObj.hostname;
+
+    // Strip www. prefix
+    if (hostname.startsWith('www.')) {
+      hostname = hostname.substring(4);
+    }
+
+    return hostname;
   } catch {
     return '';
   }

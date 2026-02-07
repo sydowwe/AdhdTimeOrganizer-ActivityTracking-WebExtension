@@ -25,7 +25,10 @@ export interface WindowActivity {
 export interface ActivityHeartbeat {
   heartbeatAt: string; // ISO 8601 timestamp
   isIdle: boolean;
-  window?: ActivityWindow; // Current or completed window
+  windowStart?: string; // ISO 8601 timestamp, rounded to 5-min boundary
+  windowMinutes?: number; // Always 5 when present
+  isFinal?: boolean; // True if window is complete and won't be updated
+  activities?: WindowActivity[]; // Activity data for the window
 }
 
 // Tab tracking state

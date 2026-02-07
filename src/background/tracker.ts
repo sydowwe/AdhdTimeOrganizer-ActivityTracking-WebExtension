@@ -8,7 +8,6 @@ import {
 import {
   extractDomain,
   isDomainBlocked,
-  shouldTrackFullUrl,
   isTrackableUrl
 } from '@shared/utils';
 import {
@@ -152,25 +151,25 @@ class ActivityTracker {
 
   private async initializeCurrentState(): Promise<void> {
     try {
-      // Get all windows to find focused one or most recently active one
-      const windows = await browser.windows.getAll({ windowTypes: ['normal'] });
-      let targetWindow = windows.find(w => w.focused);
+      // Get all windows and find a normal (non-extension) window to track
+      const allWindows = await browser.windows.getAll({ populate: true, windowTypes: ['normal', 'popup'] });
+      const normalWindows = allWindows.filter(w => w.type === 'normal');
 
-      // If no normal window is focused (e.g., popup is open), use any normal window
-      // This handles the case where popup is open during initialization
-      if (!targetWindow && windows.length > 0) {
-        targetWindow = windows[0];
-      }
+      // Prefer the focused normal window, fall back to any normal window.
+      // This ensures tracking works even when the extension popup is focused.
+      const targetWindow = normalWindows.find(w => w.focused) || normalWindows[0];
 
       if (targetWindow && targetWindow.id !== undefined) {
-        // Get active tab in target window
         const tabs = await browser.tabs.query({
           active: true,
           windowId: targetWindow.id
         });
 
-        if (tabs.length > 0 && tabs[0].id !== undefined) {
-          await this.handleTabActivated(tabs[0].id, targetWindow.id);
+        if (tabs.length > 0 && tabs[0].id !== undefined && tabs[0].url) {
+          const domain = extractDomain(tabs[0].url);
+          if (isTrackableUrl(tabs[0].url) && !isDomainBlocked(domain, this.settings.blocklist)) {
+            await this.startActiveTracking(tabs[0].id, tabs[0].url, domain);
+          }
         }
       }
 
@@ -200,13 +199,32 @@ class ActivityTracker {
     if (this.isPaused) return;
 
     try {
-      // Check if this window is focused
+      // Check if this window is focused, OR if an extension window has focus
+      // (when popup is open, we still want to track the active browser tab)
       const window = await browser.windows.get(windowId);
+
       if (!window.focused) {
-        return;
+        // Check if an extension window has focus instead
+        const allWindows = await browser.windows.getAll({ populate: true });
+        const hasExtensionWindowFocused = allWindows.some(w => {
+          return w.focused && this.isExtensionWindow(w);
+        });
+
+        // If neither the browser window nor an extension window has focus,
+        // the user is in another application - don't track as active
+        if (!hasExtensionWindowFocused) {
+          return;
+        }
       }
 
       const tab = await browser.tabs.get(tabId);
+
+      // If an extension page is activated (popup, options), preserve current tracking
+      if (tab.url?.startsWith(browser.runtime.getURL(''))) {
+        log('Extension tab activated, preserving current tracking');
+        return;
+      }
+
       if (!tab.url || !isTrackableUrl(tab.url)) {
         // End tracking of previous active tab if any
         await this.endActiveTracking();
@@ -216,6 +234,19 @@ class ActivityTracker {
       const domain = extractDomain(tab.url);
       if (isDomainBlocked(domain, this.settings.blocklist)) {
         await this.endActiveTracking();
+        return;
+      }
+
+      // If we're already tracking this exact tab as active, don't restart
+      if (this.activeTab && this.activeTab.tabId === tabId && this.activeTab.domain === domain) {
+        log('Already tracking this tab, maintaining session');
+        return;
+      }
+
+      // If we have a pending start for this same tab/domain, don't restart
+      const pending = this.pendingStarts.get(tabId);
+      if (pending && !pending.isBackground && pending.domain === domain) {
+        log('Already have pending start for this tab, maintaining');
         return;
       }
 
@@ -229,64 +260,73 @@ class ActivityTracker {
     }
   }
 
+  private isExtensionWindow(window: browser.Windows.Window): boolean {
+    const extensionUrl = browser.runtime.getURL('');
+
+    // Check if it's a popup type window (extension popups are type 'popup')
+    if (window.type === 'popup') {
+      return true;
+    }
+
+    // Check if any tab in this window is an extension page
+    if (window.tabs?.some(tab => tab.url?.startsWith(extensionUrl))) {
+      return true;
+    }
+
+    return false;
+  }
+
   private async handleWindowFocusChanged(windowId: number): Promise<void> {
     if (this.isPaused) return;
 
     try {
-      // Check if the focused window is an extension popup
-      if (windowId !== browser.windows.WINDOW_ID_NONE) {
-        const window = await browser.windows.get(windowId);
-        if (window.type === 'popup') {
-          // This is a popup window - check if it's our extension popup
-          const tabs = await browser.tabs.query({ windowId });
-          if (tabs.length > 0 && tabs[0].url) {
-            const extensionUrl = browser.runtime.getURL('');
-            if (tabs[0].url.startsWith(extensionUrl)) {
-              // This is our extension popup - ignore this focus change
-              log('Extension popup focused, maintaining tracking state');
-              return;
-            }
-          }
-        }
-      }
+      // Window focus changes should NOT change what we're tracking
+      // They should only affect whether tracking is active vs background
 
       if (windowId === browser.windows.WINDOW_ID_NONE) {
-        // Check if focus moved to a popup/devtools window (extension popup, etc)
-        // If so, ignore this focus change to maintain tracking
+        // Browser lost focus - check if it's to an extension window or another app
         const allWindows = await browser.windows.getAll({ populate: true });
-        const hasExtensionPopupFocused = allWindows.some(w => {
-          if (!w.focused || w.type !== 'popup') return false;
-          // Check if any tab in this popup window is an extension page
-          const extensionUrl = browser.runtime.getURL('');
-          return w.tabs?.some(tab => tab.url?.startsWith(extensionUrl));
+
+        const hasExtensionWindowFocused = allWindows.some(w => {
+          return w.focused && this.isExtensionWindow(w);
         });
 
-        if (hasExtensionPopupFocused) {
-          // Extension popup is focused - ignore this focus change
-          log('Extension popup focused, maintaining tracking state');
+        if (hasExtensionWindowFocused) {
+          // Extension window focused - completely ignore this event
+          log('Extension window focused, ignoring window focus change');
           return;
         }
 
-        // Browser actually lost focus - move active tab to background if visible/audible
-        if (this.activeTab) {
-          const wasActive = this.activeTab;
-          await this.endActiveTracking();
-
-          // Check if tab should become background (visible or audible)
-          const isVisible = this.visibleTabs.has(wasActive.tabId);
-          const isAudible = this.audibleTabs.has(wasActive.tabId);
-
-          if (isVisible || isAudible) {
-            await this.maybeStartBackgroundTracking(wasActive.tabId, wasActive.url);
-          }
-        }
+        // Lost focus to another application - this is handled by visibility/audible/video detection
+        // Don't change tracking state here
+        log('Browser lost focus to another application');
         return;
       }
 
-      // Window gained focus - get active tab in that window
+      // A specific window gained focus
+      try {
+        const window = await browser.windows.get(windowId, { populate: true });
+
+        if (this.isExtensionWindow(window)) {
+          // Extension window gained focus - ignore
+          log('Extension window gained focus, ignoring');
+          return;
+        }
+      } catch (e) {
+        log('Could not get window info:', e);
+      }
+
+      // Normal browser window gained focus
+      // Check if the active tab in this window is what we're already tracking
       const tabs = await browser.tabs.query({ active: true, windowId });
       if (tabs.length > 0 && tabs[0].id !== undefined) {
-        await this.handleTabActivated(tabs[0].id, windowId);
+        // Only call handleTabActivated if it's a different tab than what we're tracking
+        // This prevents restarting tracking when popup closes
+        if (!this.activeTab || this.activeTab.tabId !== tabs[0].id) {
+          await this.handleTabActivated(tabs[0].id, windowId);
+        } else {
+          log('Window regained focus, already tracking this tab');
+        }
       }
     } catch (error) {
       log('Error handling window focus changed:', error);
@@ -421,16 +461,9 @@ class ActivityTracker {
     this.isIdle = newState !== 'active';
 
     if (this.isIdle && !wasIdle) {
-      log('User became idle');
-      // End all tracking when idle
-      await this.endActiveTracking();
-      for (const tabId of this.backgroundTabs.keys()) {
-        await this.endBackgroundTracking(tabId);
-      }
+      log('User became idle, active tab will count as background');
     } else if (!this.isIdle && wasIdle) {
       log('User became active');
-      // Re-initialize tracking
-      await this.initializeCurrentState();
     }
   }
 
@@ -669,7 +702,7 @@ class ActivityTracker {
     const elapsedSeconds = Math.floor((now - this.lastTickAt) / 1000);
     this.lastTickAt = now;
 
-    if (elapsedSeconds <= 0 || this.isPaused || this.isIdle) {
+    if (elapsedSeconds <= 0 || this.isPaused) {
       return;
     }
 
@@ -686,6 +719,7 @@ class ActivityTracker {
     }
 
     // Accumulate time for active tab
+    // When idle, count active tab time as background (user isn't actively looking)
     if (this.activeTab?.isTracking) {
       const domain = this.activeTab.domain;
       if (!this.activityBuffer!.domains.has(domain)) {
@@ -696,13 +730,15 @@ class ActivityTracker {
         });
       }
       const buffer = this.activityBuffer!.domains.get(domain)!;
-      buffer.activeSeconds += elapsedSeconds;
-
-      // Track URL if configured
-      if (shouldTrackFullUrl(domain, this.settings)) {
-        const url = this.activeTab.url;
-        buffer.urlVisits.set(url, (buffer.urlVisits.get(url) || 0) + elapsedSeconds);
+      if (this.isIdle) {
+        buffer.backgroundSeconds += elapsedSeconds;
+      } else {
+        buffer.activeSeconds += elapsedSeconds;
       }
+
+      // Always track full URL
+      const url = this.activeTab.url;
+      buffer.urlVisits.set(url, (buffer.urlVisits.get(url) || 0) + elapsedSeconds);
     }
 
     // Accumulate time for background tabs
@@ -719,11 +755,9 @@ class ActivityTracker {
         const buffer = this.activityBuffer!.domains.get(domain)!;
         buffer.backgroundSeconds += elapsedSeconds;
 
-        // Track URL if configured
-        if (shouldTrackFullUrl(domain, this.settings)) {
-          const url = bgTab.url;
-          buffer.urlVisits.set(url, (buffer.urlVisits.get(url) || 0) + elapsedSeconds);
-        }
+        // Always track full URL
+        const url = bgTab.url;
+        buffer.urlVisits.set(url, (buffer.urlVisits.get(url) || 0) + elapsedSeconds);
       }
     }
 
@@ -760,7 +794,8 @@ class ActivityTracker {
         backgroundSeconds: buffer.backgroundSeconds
       };
 
-      if (mostVisitedUrl && shouldTrackFullUrl(domain, this.settings)) {
+      // Always include the most visited URL
+      if (mostVisitedUrl) {
         activity.url = mostVisitedUrl;
       }
 

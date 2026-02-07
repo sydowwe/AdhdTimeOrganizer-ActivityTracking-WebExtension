@@ -144,11 +144,19 @@ export async function sendHeartbeat(
     return true;
   }
 
+  // Build heartbeat with flattened window structure
   const heartbeat: ActivityHeartbeat = {
     heartbeatAt: getTimestamp(),
-    isIdle,
-    window: window || undefined
+    isIdle
   };
+
+  // Include window data if present
+  if (window) {
+    heartbeat.windowStart = window.windowStart;
+    heartbeat.windowMinutes = window.windowMinutes;
+    heartbeat.isFinal = window.isFinal;
+    heartbeat.activities = window.activities;
+  }
 
   try {
     log('Sending heartbeat:', heartbeat);
